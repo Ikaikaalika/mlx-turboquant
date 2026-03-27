@@ -7,6 +7,18 @@ from .core import (
     dequantize_kv_cache,
     quantize_kv_cache,
 )
+from .mlx_lm_integration import (
+    MLXLMTurboQuantPatcher,
+    TurboQuantBatchKVCache,
+    TurboQuantBatchRotatingKVCache,
+    TurboQuantConcatenateKVCache,
+    TurboQuantKVCache,
+    TurboQuantRotatingKVCache,
+    make_turbo_prompt_cache,
+    patch_mlx_lm,
+    turboquantize_mlx_lm,
+    turboquantize_prompt_cache,
+)
 
 __all__ = [
     "PackedMSECodes",
@@ -16,4 +28,14 @@ __all__ = [
     "QuantizedKVCache",
     "quantize_kv_cache",
     "dequantize_kv_cache",
+    "TurboQuantKVCache",
+    "TurboQuantRotatingKVCache",
+    "TurboQuantBatchKVCache",
+    "TurboQuantBatchRotatingKVCache",
+    "TurboQuantConcatenateKVCache",
+    "make_turbo_prompt_cache",
+    "turboquantize_prompt_cache",
+    "MLXLMTurboQuantPatcher",
+    "turboquantize_mlx_lm",
+    "patch_mlx_lm",
 ]

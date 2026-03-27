@@ -43,6 +43,37 @@ cache = quantize_kv_cache(keys, values, key_bit_width=3, value_bit_width=4, seed
 keys_hat, values_hat = dequantize_kv_cache(cache)
 ```
 
+## MLX-LM Universal Integration
+
+For broad `mlx_lm` compatibility (generate/chat/evaluate/cache_prompt + batch cache paths),
+use the patcher so prompt-cache construction returns TurboQuant-backed caches:
+
+```python
+from turboquant_mlx import patch_mlx_lm
+from mlx_lm import generate, load
+
+patcher = patch_mlx_lm(key_bit_width=3, value_bit_width=3, seed=0)
+try:
+    model, tokenizer = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+    text = generate(
+        model,
+        tokenizer,
+        prompt="Hello",
+        max_tokens=64,
+    )
+finally:
+    patcher.restore()
+```
+
+Or use a context manager:
+
+```python
+from turboquant_mlx import turboquantize_mlx_lm
+
+with turboquantize_mlx_lm(key_bit_width=3, value_bit_width=3):
+    ...
+```
+
 ## Run Tests
 
 ```bash

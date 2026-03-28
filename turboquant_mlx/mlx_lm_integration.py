@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import copy
 import importlib
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType
@@ -10,12 +10,28 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import numpy as np
 
-from .core import dequantize_kv_cache, quantize_kv_cache
+from .core import (
+    PackedMSECodes,
+    PackedProdCodes,
+    QuantizedKVCache,
+    TurboQuantMSE,
+    TurboQuantProd,
+    dequantize_kv_cache,
+    quantize_kv_cache,
+)
 
 try:
     from mlx_lm.models import cache as mlx_cache
 except Exception:  # pragma: no cover - handled by helper checks in runtime paths
     mlx_cache = None
+
+
+_DTYPE_TO_NAME: Dict[Any, str] = {
+    mx.float16: "float16",
+    mx.float32: "float32",
+    mx.bfloat16: "bfloat16",
+}
+_NAME_TO_DTYPE: Dict[str, Any] = {v: k for k, v in _DTYPE_TO_NAME.items()}
 
 
 @dataclass(frozen=True)
@@ -30,60 +46,24 @@ class TurboQuantCacheStats:
         return float(self.original_bytes / self.quantized_bytes)
 
 
-class _TurboQuantMixin:
-    def _tq_setup(
-        self,
-        *,
-        key_bit_width: int,
-        value_bit_width: int,
-        seed: int,
-        pack: bool,
-        cache_id: int = 0,
-    ) -> None:
-        self._tq_key_bit_width = int(key_bit_width)
-        self._tq_value_bit_width = int(value_bit_width)
-        self._tq_seed = int(seed)
-        self._tq_cache_id = int(cache_id)
-        self._tq_pack = bool(pack)
-        self._tq_stats: Optional[TurboQuantCacheStats] = None
+@dataclass(frozen=True)
+class _TurboQuantConfig:
+    key_bit_width: int
+    value_bit_width: int
+    seed: int
+    pack: bool
+    cache_id: int
 
-    @property
-    def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
-        return self._tq_stats
 
-    def _tq_quantize_pair(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
-        cache = quantize_kv_cache(
-            keys=keys,
-            values=values,
-            key_bit_width=self._tq_key_bit_width,
-            value_bit_width=self._tq_value_bit_width,
-            seed=self._tq_seed + self._tq_cache_id,
-            pack=self._tq_pack,
-        )
-        keys_hat, values_hat = dequantize_kv_cache(cache)
+def _dtype_name(dtype: Any) -> str:
+    for known, name in _DTYPE_TO_NAME.items():
+        if dtype == known:
+            return name
+    return "float32"
 
-        original_bytes = int(np.asarray(keys).nbytes + np.asarray(values).nbytes)
-        quantized_bytes = int(cache.key_codes.storage_bytes() + cache.value_codes.storage_bytes())
-        self._tq_stats = TurboQuantCacheStats(
-            original_bytes=original_bytes,
-            quantized_bytes=quantized_bytes,
-        )
 
-        return keys_hat.astype(keys.dtype), values_hat.astype(values.dtype)
-
-    def _tq_write_back(self, keys: mx.array, values: mx.array) -> None:
-        if getattr(self, "keys", None) is None or getattr(self, "values", None) is None:
-            return
-
-        seq_len = int(keys.shape[2])
-        self.keys[..., :seq_len, :] = keys
-        self.values[..., :seq_len, :] = values
-
-    def _tq_current_kv(self) -> tuple[mx.array, mx.array]:
-        state = self.state
-        if isinstance(state, tuple) and len(state) >= 2:
-            return state[0], state[1]
-        raise RuntimeError("Unexpected cache state format")
+def _dtype_from_name(name: str) -> Any:
+    return _NAME_TO_DTYPE.get(name, mx.float32)
 
 
 def _ensure_mlx_lm_available() -> ModuleType:
@@ -94,39 +74,233 @@ def _ensure_mlx_lm_available() -> ModuleType:
     return mlx_cache
 
 
-def _copy_cache_state(dst: Any, src: Any) -> None:
-    # Some mlx_lm cache classes (e.g. KVCache) raise when state is accessed
-    # before first update because `keys`/`values` are still None.
-    if hasattr(src, "keys") and getattr(src, "keys") is None:
-        if hasattr(dst, "keys"):
-            dst.keys = None
-        if hasattr(dst, "values"):
-            dst.values = None
-    else:
-        dst.state = src.state
-    try:
-        dst.meta_state = src.meta_state
-    except Exception:
-        pass
+class _TurboQuantCompressedMixin:
+    """Mixin that stores compressed KV codes as canonical cache state."""
 
-    for attr in (
-        "offset",
-        "_idx",
-        "_offset",
-        "rotated",
-        "keep",
-        "max_size",
-        "left_padding",
-        "start_position",
-        "chunk_size",
-    ):
-        if hasattr(src, attr):
-            setattr(dst, attr, copy.deepcopy(getattr(src, attr)))
+    def _tq_setup(
+        self,
+        *,
+        key_bit_width: int,
+        value_bit_width: int,
+        seed: int,
+        pack: bool,
+        cache_id: int = 0,
+    ) -> None:
+        self._tq_cfg = _TurboQuantConfig(
+            key_bit_width=int(key_bit_width),
+            value_bit_width=int(value_bit_width),
+            seed=int(seed),
+            pack=bool(pack),
+            cache_id=int(cache_id),
+        )
+        self._tq_cache: Optional[QuantizedKVCache] = None
+        self._tq_stats: Optional[TurboQuantCacheStats] = None
+        self._tq_key_dim: int = 0
+        self._tq_value_dim: int = 0
+        self._tq_key_dtype: Any = mx.float32
+        self._tq_value_dtype: Any = mx.float32
+
+    @property
+    def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
+        return self._tq_stats
+
+    def _tq_update_from_dense(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        *,
+        key_dtype: Any,
+        value_dtype: Any,
+    ) -> tuple[mx.array, mx.array]:
+        qcache = quantize_kv_cache(
+            keys=keys,
+            values=values,
+            key_bit_width=self._tq_cfg.key_bit_width,
+            value_bit_width=self._tq_cfg.value_bit_width,
+            seed=self._tq_cfg.seed + self._tq_cfg.cache_id,
+            pack=self._tq_cfg.pack,
+        )
+        keys_hat, values_hat = dequantize_kv_cache(qcache)
+
+        self._tq_cache = qcache
+        self._tq_key_dim = int(keys.shape[-1])
+        self._tq_value_dim = int(values.shape[-1])
+        self._tq_key_dtype = key_dtype
+        self._tq_value_dtype = value_dtype
+
+        original_bytes = int(np.asarray(keys).nbytes + np.asarray(values).nbytes)
+        quantized_bytes = int(
+            qcache.key_codes.storage_bytes() + qcache.value_codes.storage_bytes()
+        )
+        self._tq_stats = TurboQuantCacheStats(
+            original_bytes=original_bytes,
+            quantized_bytes=quantized_bytes,
+        )
+
+        return keys_hat.astype(key_dtype), values_hat.astype(value_dtype)
+
+    def _tq_decode_to_dense(self) -> tuple[mx.array, mx.array]:
+        if self._tq_cache is None:
+            raise RuntimeError("No TurboQuant cache is available to decode.")
+        keys, values = dequantize_kv_cache(self._tq_cache)
+        return keys.astype(self._tq_key_dtype), values.astype(self._tq_value_dtype)
+
+    def _tq_clear_dense_storage(self) -> None:
+        if hasattr(self, "keys"):
+            self.keys = None
+        if hasattr(self, "values"):
+            self.values = None
+
+    def _tq_serialize_quantized_state(self) -> Any:
+        if self._tq_cache is None:
+            return []
+
+        key_codes = self._tq_cache.key_codes
+        value_codes = self._tq_cache.value_codes
+
+        key_indices = key_codes.packed_indices
+        if key_indices is None:
+            key_indices = mx.array(np.zeros((0,), dtype=np.uint8))
+
+        leading_shape = mx.array(np.asarray(key_codes.leading_shape, dtype=np.int32))
+
+        return (
+            key_indices,
+            key_codes.packed_qjl,
+            key_codes.residual_norms,
+            key_codes.norms,
+            value_codes.packed_indices,
+            value_codes.norms,
+            leading_shape,
+        )
+
+    def _tq_deserialize_quantized_state(self, state: Any) -> None:
+        if not state:
+            self._tq_cache = None
+            return
+
+        if self._tq_key_dim <= 0 or self._tq_value_dim <= 0:
+            raise ValueError(
+                "Cannot deserialize TurboQuant state before key/value dimensions are known."
+            )
+
+        (
+            key_indices,
+            key_signs,
+            key_residual_norms,
+            key_norms,
+            value_indices,
+            value_norms,
+            leading_shape_array,
+        ) = state
+
+        leading_shape = tuple(int(v) for v in np.asarray(leading_shape_array).tolist())
+
+        key_codes = PackedProdCodes(
+            packed_indices=(
+                None
+                if self._tq_cfg.key_bit_width == 1
+                else key_indices.astype(mx.uint8)
+            ),
+            packed_qjl=key_signs.astype(mx.uint8),
+            residual_norms=key_residual_norms.astype(mx.float32),
+            norms=key_norms.astype(mx.float32),
+            leading_shape=leading_shape,
+            dimension=self._tq_key_dim,
+            bit_width=self._tq_cfg.key_bit_width,
+            packed=True,
+        )
+        value_codes = PackedMSECodes(
+            packed_indices=value_indices.astype(mx.uint8),
+            norms=value_norms.astype(mx.float32),
+            leading_shape=leading_shape,
+            dimension=self._tq_value_dim,
+            bit_width=self._tq_cfg.value_bit_width,
+            packed=True,
+        )
+
+        key_quantizer = TurboQuantProd(
+            dimension=self._tq_key_dim,
+            bit_width=self._tq_cfg.key_bit_width,
+            seed=self._tq_cfg.seed + self._tq_cfg.cache_id,
+        )
+        value_quantizer = TurboQuantMSE(
+            dimension=self._tq_value_dim,
+            bit_width=self._tq_cfg.value_bit_width,
+            seed=self._tq_cfg.seed + 13 + self._tq_cfg.cache_id,
+        )
+
+        self._tq_cache = QuantizedKVCache(
+            key_quantizer=key_quantizer,
+            value_quantizer=value_quantizer,
+            key_codes=key_codes,
+            value_codes=value_codes,
+        )
+
+
+class _LegacyTurboQuantMixin:
+    """Fallback mixin for cache types not yet using compressed canonical state."""
+
+    _warned_legacy: bool = False
+
+    def _legacy_tq_setup(
+        self,
+        *,
+        key_bit_width: int,
+        value_bit_width: int,
+        seed: int,
+        pack: bool,
+        cache_id: int = 0,
+    ) -> None:
+        self._legacy_tq_cfg = _TurboQuantConfig(
+            key_bit_width=int(key_bit_width),
+            value_bit_width=int(value_bit_width),
+            seed=int(seed),
+            pack=bool(pack),
+            cache_id=int(cache_id),
+        )
+        self._legacy_stats: Optional[TurboQuantCacheStats] = None
+
+    @property
+    def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
+        return self._legacy_stats
+
+    def _legacy_quantize_and_writeback(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+        if not self.__class__._warned_legacy:
+            warnings.warn(
+                f"{self.__class__.__name__} currently uses compatibility mode (no compressed canonical state).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.__class__._warned_legacy = True
+
+        qcache = quantize_kv_cache(
+            keys=keys,
+            values=values,
+            key_bit_width=self._legacy_tq_cfg.key_bit_width,
+            value_bit_width=self._legacy_tq_cfg.value_bit_width,
+            seed=self._legacy_tq_cfg.seed + self._legacy_tq_cfg.cache_id,
+            pack=self._legacy_tq_cfg.pack,
+        )
+        keys_hat, values_hat = dequantize_kv_cache(qcache)
+        self._legacy_stats = TurboQuantCacheStats(
+            original_bytes=int(np.asarray(keys).nbytes + np.asarray(values).nbytes),
+            quantized_bytes=int(
+                qcache.key_codes.storage_bytes() + qcache.value_codes.storage_bytes()
+            ),
+        )
+
+        if getattr(self, "keys", None) is not None and getattr(self, "values", None) is not None:
+            seq_len = int(keys_hat.shape[2])
+            self.keys[..., :seq_len, :] = keys_hat.astype(self.keys.dtype)
+            self.values[..., :seq_len, :] = values_hat.astype(self.values.dtype)
+
+        return keys_hat.astype(keys.dtype), values_hat.astype(values.dtype)
 
 
 if mlx_cache is not None:
 
-    class TurboQuantConcatenateKVCache(_TurboQuantMixin, mlx_cache.ConcatenateKVCache):
+    class TurboQuantKVCache(_TurboQuantCompressedMixin, mlx_cache.KVCache):
         def __init__(
             self,
             *,
@@ -145,80 +319,164 @@ if mlx_cache is not None:
                 cache_id=cache_id,
             )
 
-        @classmethod
-        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantConcatenateKVCache":
-            obj = cls(**kwargs)
-            _copy_cache_state(obj, cache)
-            return obj
-
-        @classmethod
-        def from_state(cls, state, meta_state):
-            obj = cls()
-            obj.state = state
-            try:
-                obj.meta_state = meta_state
-            except Exception:
-                pass
-            return obj
-
-        def update_and_fetch(self, keys, values):
-            keys, values = super().update_and_fetch(keys, values)
-            keys_hat, values_hat = self._tq_quantize_pair(keys, values)
-            self._tq_write_back(keys_hat, values_hat)
-            return self._tq_current_kv()
-
-
-    class TurboQuantKVCache(_TurboQuantMixin, mlx_cache.KVCache):
-        def __init__(
-            self,
-            *,
-            key_bit_width: int = 3,
-            value_bit_width: int = 3,
-            seed: int = 0,
-            pack: bool = True,
-            cache_id: int = 0,
-        ):
-            super().__init__()
-            self._tq_setup(
-                key_bit_width=key_bit_width,
-                value_bit_width=value_bit_width,
-                seed=seed,
-                pack=pack,
-                cache_id=cache_id,
-            )
+        def _materialize_dense_base(self) -> None:
+            if self._tq_cache is None:
+                self.keys = None
+                self.values = None
+                return
+            keys, values = self._tq_decode_to_dense()
+            self.keys = keys
+            self.values = values
+            self.offset = int(keys.shape[2])
 
         @classmethod
         def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantKVCache":
             obj = cls(**kwargs)
-            _copy_cache_state(obj, cache)
+            if getattr(cache, "keys", None) is not None:
+                keys, values = cache.state
+                obj._tq_update_from_dense(
+                    keys,
+                    values,
+                    key_dtype=keys.dtype,
+                    value_dtype=values.dtype,
+                )
+                obj.offset = int(keys.shape[2])
+            else:
+                obj.offset = int(getattr(cache, "offset", 0))
             return obj
 
         @classmethod
         def from_state(cls, state, meta_state):
-            obj = cls()
+            if not meta_state or len(meta_state) < 10:
+                obj = cls()
+                obj.state = state
+                return obj
+
+            (
+                offset,
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+            ) = meta_state
+            obj = cls(
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            obj.offset = int(offset)
+            obj._tq_key_dim = int(key_dim)
+            obj._tq_value_dim = int(value_dim)
+            obj._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            obj._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
             obj.state = state
-            try:
-                obj.meta_state = meta_state
-            except Exception:
-                pass
             return obj
 
+        @property
+        def meta_state(self):
+            return tuple(
+                map(
+                    str,
+                    (
+                        int(getattr(self, "offset", 0)),
+                        self._tq_cfg.key_bit_width,
+                        self._tq_cfg.value_bit_width,
+                        self._tq_cfg.seed,
+                        int(self._tq_cfg.pack),
+                        self._tq_key_dim,
+                        self._tq_value_dim,
+                        _dtype_name(self._tq_key_dtype),
+                        _dtype_name(self._tq_value_dtype),
+                        self._tq_cfg.cache_id,
+                    ),
+                )
+            )
+
+        @meta_state.setter
+        def meta_state(self, v):
+            (
+                offset,
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+            ) = v
+            self.offset = int(offset)
+            self._tq_cfg = _TurboQuantConfig(
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            self._tq_key_dim = int(key_dim)
+            self._tq_value_dim = int(value_dim)
+            self._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            self._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
+
+        @property
+        def state(self):
+            return self._tq_serialize_quantized_state()
+
+        @state.setter
+        def state(self, v):
+            self._tq_deserialize_quantized_state(v)
+            if self._tq_cache is not None:
+                self.offset = int(self._tq_cache.key_codes.leading_shape[-1])
+
         def update_and_fetch(self, keys, values):
-            keys, values = super().update_and_fetch(keys, values)
-            keys_hat, values_hat = self._tq_quantize_pair(keys, values)
-            self._tq_write_back(keys_hat, values_hat)
-            return self._tq_current_kv()
+            self._materialize_dense_base()
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            keys_hat, values_hat = self._tq_update_from_dense(
+                dense_keys,
+                dense_values,
+                key_dtype=keys.dtype,
+                value_dtype=values.dtype,
+            )
+            self._tq_clear_dense_storage()
+            self.offset = int(keys_hat.shape[2])
+            return keys_hat, values_hat
+
+        def trim(self, n):
+            if self._tq_cache is None:
+                return 0
+
+            self._materialize_dense_base()
+            trimmed = super().trim(n)
+            if self.offset > 0:
+                dense_keys, dense_values = super().state
+                self._tq_update_from_dense(
+                    dense_keys,
+                    dense_values,
+                    key_dtype=self._tq_key_dtype,
+                    value_dtype=self._tq_value_dtype,
+                )
+            else:
+                self._tq_cache = None
+
+            self._tq_clear_dense_storage()
+            return trimmed
 
         def to_quantized(self, group_size: int = 64, bits: int = 4):
-            # Keep TurboQuant active even when mlx_lm tries to switch to built-in quantization.
             return self
 
 
-    class TurboQuantRotatingKVCache(_TurboQuantMixin, mlx_cache.RotatingKVCache):
+    class TurboQuantChunkedKVCache(_TurboQuantCompressedMixin, mlx_cache.ChunkedKVCache):
         def __init__(
             self,
-            max_size: int,
-            keep: int = 0,
+            chunk_size: int,
             *,
             key_bit_width: int = 3,
             value_bit_width: int = 3,
@@ -226,7 +484,7 @@ if mlx_cache is not None:
             pack: bool = True,
             cache_id: int = 0,
         ):
-            super().__init__(max_size=max_size, keep=keep)
+            super().__init__(chunk_size=chunk_size)
             self._tq_setup(
                 key_bit_width=key_bit_width,
                 value_bit_width=value_bit_width,
@@ -234,32 +492,194 @@ if mlx_cache is not None:
                 pack=pack,
                 cache_id=cache_id,
             )
+            self._tq_start_position = int(self.start_position)
+
+        def _materialize_dense_base(self) -> None:
+            self.start_position = int(self._tq_start_position)
+            if self._tq_cache is None:
+                self.keys = None
+                self.values = None
+                self.offset = int(self.start_position)
+                return
+
+            keys, values = self._tq_decode_to_dense()
+            self.keys = keys
+            self.values = values
+            self.offset = int(self.start_position + keys.shape[2])
+
+        def _update_from_current_dense(self) -> None:
+            if self.keys is None or self.values is None:
+                self._tq_cache = None
+                return
+            active_len = max(0, int(self.offset - self.start_position))
+            self._tq_update_from_dense(
+                self.keys[..., :active_len, :],
+                self.values[..., :active_len, :],
+                key_dtype=self._tq_key_dtype,
+                value_dtype=self._tq_value_dtype,
+            )
 
         @classmethod
-        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantRotatingKVCache":
-            obj = cls(max_size=cache.max_size, keep=cache.keep, **kwargs)
-            _copy_cache_state(obj, cache)
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantChunkedKVCache":
+            chunk_size = int(getattr(cache, "chunk_size"))
+            obj = cls(chunk_size=chunk_size, **kwargs)
+            obj.start_position = int(getattr(cache, "start_position", 0))
+            obj._tq_start_position = int(obj.start_position)
+            obj.offset = int(getattr(cache, "offset", obj.start_position))
+            if getattr(cache, "keys", None) is not None:
+                dense_keys, dense_values = cache.state
+                obj._tq_update_from_dense(
+                    dense_keys,
+                    dense_values,
+                    key_dtype=dense_keys.dtype,
+                    value_dtype=dense_values.dtype,
+                )
             return obj
 
         @classmethod
         def from_state(cls, state, meta_state):
-            keep, max_size, _, _ = map(int, meta_state)
-            obj = cls(max_size=max_size, keep=keep)
+            if not meta_state or len(meta_state) < 12:
+                obj = cls(chunk_size=256)
+                obj.state = state
+                return obj
+
+            (
+                offset,
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+                chunk_size,
+                start_position,
+            ) = meta_state
+            obj = cls(
+                chunk_size=int(chunk_size),
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            obj.offset = int(offset)
+            obj.start_position = int(start_position)
+            obj._tq_start_position = int(start_position)
+            obj._tq_key_dim = int(key_dim)
+            obj._tq_value_dim = int(value_dim)
+            obj._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            obj._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
             obj.state = state
-            obj.meta_state = meta_state
             return obj
 
+        @property
+        def meta_state(self):
+            return tuple(
+                map(
+                    str,
+                    (
+                        int(getattr(self, "offset", 0)),
+                        self._tq_cfg.key_bit_width,
+                        self._tq_cfg.value_bit_width,
+                        self._tq_cfg.seed,
+                        int(self._tq_cfg.pack),
+                        self._tq_key_dim,
+                        self._tq_value_dim,
+                        _dtype_name(self._tq_key_dtype),
+                        _dtype_name(self._tq_value_dtype),
+                        self._tq_cfg.cache_id,
+                        int(self.chunk_size),
+                        int(self._tq_start_position),
+                    ),
+                )
+            )
+
+        @meta_state.setter
+        def meta_state(self, v):
+            (
+                offset,
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+                chunk_size,
+                start_position,
+            ) = v
+            self.offset = int(offset)
+            self._tq_cfg = _TurboQuantConfig(
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            self._tq_key_dim = int(key_dim)
+            self._tq_value_dim = int(value_dim)
+            self._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            self._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
+            self.chunk_size = int(chunk_size)
+            self.start_position = int(start_position)
+            self._tq_start_position = int(start_position)
+
+        @property
+        def state(self):
+            return self._tq_serialize_quantized_state()
+
+        @state.setter
+        def state(self, v):
+            self._tq_deserialize_quantized_state(v)
+            if self._tq_cache is not None:
+                active_len = int(self._tq_cache.key_codes.leading_shape[-1])
+                self.offset = int(self._tq_start_position + active_len)
+
+        def maybe_trim_front(self):
+            self._materialize_dense_base()
+            super().maybe_trim_front()
+            self._tq_start_position = int(self.start_position)
+            self._update_from_current_dense()
+            self._tq_clear_dense_storage()
+
         def update_and_fetch(self, keys, values):
-            keys, values = super().update_and_fetch(keys, values)
-            keys_hat, values_hat = self._tq_quantize_pair(keys, values)
-            self._tq_write_back(keys_hat, values_hat)
-            return self._tq_current_kv()
+            self._materialize_dense_base()
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            keys_hat, values_hat = self._tq_update_from_dense(
+                dense_keys,
+                dense_values,
+                key_dtype=keys.dtype,
+                value_dtype=values.dtype,
+            )
+            self._tq_start_position = int(self.start_position)
+            self._tq_clear_dense_storage()
+            self.offset = int(self.start_position + keys_hat.shape[2])
+            return keys_hat, values_hat
+
+        def trim(self, n):
+            if self._tq_cache is None:
+                return 0
+
+            self._materialize_dense_base()
+            trimmed = super().trim(n)
+            if self.offset > self.start_position:
+                self._update_from_current_dense()
+            else:
+                self._tq_cache = None
+            self._tq_start_position = int(self.start_position)
+            self._tq_clear_dense_storage()
+            return trimmed
 
         def to_quantized(self, group_size: int = 64, bits: int = 4):
             return self
 
 
-    class TurboQuantBatchKVCache(_TurboQuantMixin, mlx_cache.BatchKVCache):
+    class TurboQuantBatchKVCache(_TurboQuantCompressedMixin, mlx_cache.BatchKVCache):
         def __init__(
             self,
             left_padding: List[int],
@@ -278,18 +698,240 @@ if mlx_cache is not None:
                 pack=pack,
                 cache_id=cache_id,
             )
+            self._tq_offset = self.offset
+            self._tq_left_padding = self.left_padding
+            self._tq_idx = int(self._idx)
+
+        def _materialize_dense_base(self) -> None:
+            self.offset = self._tq_offset
+            self.left_padding = self._tq_left_padding
+            self._idx = int(self._tq_idx)
+
+            if self._tq_cache is None:
+                self.keys = None
+                self.values = None
+                return
+
+            keys, values = self._tq_decode_to_dense()
+            self.keys = keys
+            self.values = values
+
+        def _sync_snapshot_from_base(self) -> None:
+            self._tq_offset = self.offset
+            self._tq_left_padding = self.left_padding
+            self._tq_idx = int(self._idx)
 
         @classmethod
         def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantBatchKVCache":
-            left_padding = np.asarray(cache.left_padding).astype(np.int32).tolist()
+            left_padding = (
+                np.asarray(cache.left_padding).astype(np.int32).tolist()
+                if getattr(cache, "left_padding", None) is not None
+                else []
+            )
             obj = cls(left_padding=left_padding, **kwargs)
-            _copy_cache_state(obj, cache)
+            obj._tq_offset = copy_array(getattr(cache, "offset", obj.offset))
+            obj._tq_left_padding = copy_array(getattr(cache, "left_padding", obj.left_padding))
+            obj._tq_idx = int(getattr(cache, "_idx", obj._idx))
+
+            if getattr(cache, "keys", None) is not None:
+                dense_keys, dense_values, _, _ = cache.state
+                obj._tq_update_from_dense(
+                    dense_keys,
+                    dense_values,
+                    key_dtype=dense_keys.dtype,
+                    value_dtype=dense_values.dtype,
+                )
             return obj
 
         @classmethod
         def from_state(cls, state, meta_state):
-            _, _, _, left_padding = state
-            obj = cls(left_padding=np.asarray(left_padding).astype(np.int32).tolist())
+            if not meta_state or len(meta_state) < 9:
+                obj = cls(left_padding=[])
+                obj.state = state
+                return obj
+
+            (
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+            ) = meta_state
+
+            left_padding = []
+            if state and len(state) >= 10:
+                left_padding = np.asarray(state[8]).astype(np.int32).tolist()
+
+            obj = cls(
+                left_padding=left_padding,
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            obj._tq_key_dim = int(key_dim)
+            obj._tq_value_dim = int(value_dim)
+            obj._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            obj._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
+            obj.state = state
+            return obj
+
+        @property
+        def meta_state(self):
+            return tuple(
+                map(
+                    str,
+                    (
+                        self._tq_cfg.key_bit_width,
+                        self._tq_cfg.value_bit_width,
+                        self._tq_cfg.seed,
+                        int(self._tq_cfg.pack),
+                        self._tq_key_dim,
+                        self._tq_value_dim,
+                        _dtype_name(self._tq_key_dtype),
+                        _dtype_name(self._tq_value_dtype),
+                        self._tq_cfg.cache_id,
+                    ),
+                )
+            )
+
+        @meta_state.setter
+        def meta_state(self, v):
+            (
+                key_bits,
+                value_bits,
+                seed,
+                pack,
+                key_dim,
+                value_dim,
+                key_dtype_name,
+                value_dtype_name,
+                cache_id,
+            ) = v
+            self._tq_cfg = _TurboQuantConfig(
+                key_bit_width=int(key_bits),
+                value_bit_width=int(value_bits),
+                seed=int(seed),
+                pack=bool(int(pack)),
+                cache_id=int(cache_id),
+            )
+            self._tq_key_dim = int(key_dim)
+            self._tq_value_dim = int(value_dim)
+            self._tq_key_dtype = _dtype_from_name(str(key_dtype_name))
+            self._tq_value_dtype = _dtype_from_name(str(value_dtype_name))
+
+        @property
+        def state(self):
+            core = self._tq_serialize_quantized_state()
+            if not core:
+                return []
+            return (
+                core[0],
+                core[1],
+                core[2],
+                core[3],
+                core[4],
+                core[5],
+                core[6],
+                self._tq_offset,
+                self._tq_left_padding,
+                mx.array(np.array([self._tq_idx], dtype=np.int32)),
+            )
+
+        @state.setter
+        def state(self, v):
+            if not v:
+                self._tq_cache = None
+                return
+            core = v[:7]
+            self._tq_deserialize_quantized_state(core)
+            self._tq_offset = v[7]
+            self._tq_left_padding = v[8]
+            self._tq_idx = int(np.asarray(v[9])[0])
+            self.offset = self._tq_offset
+            self.left_padding = self._tq_left_padding
+            self._idx = self._tq_idx
+
+        def update_and_fetch(self, keys, values):
+            self._materialize_dense_base()
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            self._sync_snapshot_from_base()
+            keys_hat, values_hat = self._tq_update_from_dense(
+                dense_keys,
+                dense_values,
+                key_dtype=keys.dtype,
+                value_dtype=values.dtype,
+            )
+            self._tq_clear_dense_storage()
+            return keys_hat, values_hat
+
+        def filter(self, batch_indices):
+            self._materialize_dense_base()
+            super().filter(batch_indices)
+            self._sync_snapshot_from_base()
+
+            if self.keys is not None:
+                self._tq_update_from_dense(
+                    self.keys[..., : self._idx, :],
+                    self.values[..., : self._idx, :],
+                    key_dtype=self._tq_key_dtype,
+                    value_dtype=self._tq_value_dtype,
+                )
+            else:
+                self._tq_cache = None
+            self._tq_clear_dense_storage()
+
+        def extend(self, other):
+            self._materialize_dense_base()
+            if hasattr(other, "_materialize_dense_base"):
+                other._materialize_dense_base()
+            super().extend(other)
+            self._sync_snapshot_from_base()
+
+            self._tq_update_from_dense(
+                self.keys[..., : self._idx, :],
+                self.values[..., : self._idx, :],
+                key_dtype=self._tq_key_dtype,
+                value_dtype=self._tq_value_dtype,
+            )
+            self._tq_clear_dense_storage()
+
+
+    class TurboQuantConcatenateKVCache(_LegacyTurboQuantMixin, mlx_cache.ConcatenateKVCache):
+        def __init__(
+            self,
+            *,
+            key_bit_width: int = 3,
+            value_bit_width: int = 3,
+            seed: int = 0,
+            pack: bool = True,
+            cache_id: int = 0,
+        ):
+            super().__init__()
+            self._legacy_tq_setup(
+                key_bit_width=key_bit_width,
+                value_bit_width=value_bit_width,
+                seed=seed,
+                pack=pack,
+                cache_id=cache_id,
+            )
+
+        @classmethod
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantConcatenateKVCache":
+            obj = cls(**kwargs)
+            obj.keys = getattr(cache, "keys", None)
+            obj.values = getattr(cache, "values", None)
+            obj.offset = int(getattr(cache, "offset", 0))
+            return obj
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            obj = cls()
             obj.state = state
             try:
                 obj.meta_state = meta_state
@@ -298,13 +940,55 @@ if mlx_cache is not None:
             return obj
 
         def update_and_fetch(self, keys, values):
-            keys, values = super().update_and_fetch(keys, values)
-            keys_hat, values_hat = self._tq_quantize_pair(keys, values)
-            self._tq_write_back(keys_hat, values_hat)
-            return self._tq_current_kv()
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            return self._legacy_quantize_and_writeback(dense_keys, dense_values)
 
 
-    class TurboQuantBatchRotatingKVCache(_TurboQuantMixin, mlx_cache.BatchRotatingKVCache):
+    class TurboQuantRotatingKVCache(_LegacyTurboQuantMixin, mlx_cache.RotatingKVCache):
+        def __init__(
+            self,
+            max_size: int,
+            keep: int = 0,
+            *,
+            key_bit_width: int = 3,
+            value_bit_width: int = 3,
+            seed: int = 0,
+            pack: bool = True,
+            cache_id: int = 0,
+        ):
+            super().__init__(max_size=max_size, keep=keep)
+            self._legacy_tq_setup(
+                key_bit_width=key_bit_width,
+                value_bit_width=value_bit_width,
+                seed=seed,
+                pack=pack,
+                cache_id=cache_id,
+            )
+
+        @classmethod
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantRotatingKVCache":
+            obj = cls(max_size=cache.max_size, keep=cache.keep, **kwargs)
+            obj.state = cache.state
+            obj.meta_state = cache.meta_state
+            return obj
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            keep, max_size, _, _ = map(int, meta_state)
+            obj = cls(max_size=max_size, keep=keep)
+            obj.state = state
+            obj.meta_state = meta_state
+            return obj
+
+        def update_and_fetch(self, keys, values):
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            return self._legacy_quantize_and_writeback(dense_keys, dense_values)
+
+        def to_quantized(self, group_size: int = 64, bits: int = 4):
+            return self
+
+
+    class TurboQuantBatchRotatingKVCache(_LegacyTurboQuantMixin, mlx_cache.BatchRotatingKVCache):
         def __init__(
             self,
             max_size: int,
@@ -317,7 +1001,7 @@ if mlx_cache is not None:
             cache_id: int = 0,
         ):
             super().__init__(max_size=max_size, left_padding=left_padding)
-            self._tq_setup(
+            self._legacy_tq_setup(
                 key_bit_width=key_bit_width,
                 value_bit_width=value_bit_width,
                 seed=seed,
@@ -329,64 +1013,82 @@ if mlx_cache is not None:
         def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantBatchRotatingKVCache":
             left_padding = np.asarray(cache.left_padding).astype(np.int32).tolist()
             obj = cls(max_size=cache.max_size, left_padding=left_padding, **kwargs)
-            _copy_cache_state(obj, cache)
+            obj.state = cache.state
+            obj.meta_state = cache.meta_state
             return obj
 
         @classmethod
         def from_state(cls, state, meta_state):
             _, _, _, left_padding = state
             max_size = int(meta_state[0])
-            obj = cls(
-                max_size=max_size,
-                left_padding=np.asarray(left_padding).astype(np.int32).tolist(),
-            )
+            obj = cls(max_size=max_size, left_padding=np.asarray(left_padding).tolist())
             obj.state = state
             obj.meta_state = meta_state
             return obj
 
         def update_and_fetch(self, keys, values):
-            keys, values = super().update_and_fetch(keys, values)
-            keys_hat, values_hat = self._tq_quantize_pair(keys, values)
-            self._tq_write_back(keys_hat, values_hat)
-            return self._tq_current_kv()
+            dense_keys, dense_values = super().update_and_fetch(keys, values)
+            return self._legacy_quantize_and_writeback(dense_keys, dense_values)
+
 
 else:  # pragma: no cover - mlx_lm unavailable fallback types
-
-    class TurboQuantConcatenateKVCache:  # type: ignore[override]
-        pass
 
     class TurboQuantKVCache:  # type: ignore[override]
         pass
 
-    class TurboQuantRotatingKVCache:  # type: ignore[override]
+    class TurboQuantChunkedKVCache:  # type: ignore[override]
         pass
 
     class TurboQuantBatchKVCache:  # type: ignore[override]
+        pass
+
+    class TurboQuantConcatenateKVCache:  # type: ignore[override]
+        pass
+
+    class TurboQuantRotatingKVCache:  # type: ignore[override]
         pass
 
     class TurboQuantBatchRotatingKVCache:  # type: ignore[override]
         pass
 
 
+def copy_array(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, mx.array):
+        return mx.array(np.asarray(x))
+    return x
+
+
 if mlx_cache is not None:
     # Register classes for mlx_lm cache (de)serialization resolution.
     mlx_cache.TurboQuantKVCache = TurboQuantKVCache
-    mlx_cache.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
+    mlx_cache.TurboQuantChunkedKVCache = TurboQuantChunkedKVCache
     mlx_cache.TurboQuantBatchKVCache = TurboQuantBatchKVCache
-    mlx_cache.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
     mlx_cache.TurboQuantConcatenateKVCache = TurboQuantConcatenateKVCache
+    mlx_cache.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
+    mlx_cache.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
 
 
-def _wrap_single_cache(cache_obj: Any, *, key_bit_width: int, value_bit_width: int, seed: int, pack: bool, cache_id: int) -> Any:
+def _wrap_single_cache(
+    cache_obj: Any,
+    *,
+    key_bit_width: int,
+    value_bit_width: int,
+    seed: int,
+    pack: bool,
+    cache_id: int,
+) -> Any:
     cache_mod = _ensure_mlx_lm_available()
 
     if isinstance(
         cache_obj,
         (
-            TurboQuantConcatenateKVCache,
             TurboQuantKVCache,
-            TurboQuantRotatingKVCache,
+            TurboQuantChunkedKVCache,
             TurboQuantBatchKVCache,
+            TurboQuantConcatenateKVCache,
+            TurboQuantRotatingKVCache,
             TurboQuantBatchRotatingKVCache,
         ),
     ):
@@ -414,17 +1116,24 @@ def _wrap_single_cache(cache_obj: Any, *, key_bit_width: int, value_bit_width: i
         ]
         return cache_mod.CacheList(*wrapped)
 
-    if isinstance(cache_obj, cache_mod.BatchRotatingKVCache):
-        return TurboQuantBatchRotatingKVCache.from_cache(cache_obj, **kwargs)
     if isinstance(cache_obj, cache_mod.BatchKVCache):
         return TurboQuantBatchKVCache.from_cache(cache_obj, **kwargs)
-    if isinstance(cache_obj, cache_mod.RotatingKVCache):
-        return TurboQuantRotatingKVCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.ChunkedKVCache):
+        return TurboQuantChunkedKVCache.from_cache(cache_obj, **kwargs)
     if isinstance(cache_obj, cache_mod.KVCache):
         return TurboQuantKVCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.BatchRotatingKVCache):
+        return TurboQuantBatchRotatingKVCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.RotatingKVCache):
+        return TurboQuantRotatingKVCache.from_cache(cache_obj, **kwargs)
     if isinstance(cache_obj, cache_mod.ConcatenateKVCache):
         return TurboQuantConcatenateKVCache.from_cache(cache_obj, **kwargs)
 
+    warnings.warn(
+        f"TurboQuant integration is skipping unsupported cache type: {type(cache_obj)!r}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     return cache_obj
 
 
@@ -439,7 +1148,7 @@ def turboquantize_prompt_cache(
     """
     Wrap a prompt cache so KV updates use TurboQuant across supported mlx_lm cache types.
 
-    Unsupported cache entries are left untouched.
+    Unsupported cache entries are left untouched with a runtime warning.
     """
     _ensure_mlx_lm_available()
 
@@ -519,12 +1228,12 @@ class MLXLMTurboQuantPatcher:
 
         cache_mod = importlib.import_module("mlx_lm.models.cache")
 
-        # Register wrappers on mlx_lm cache module so serialization helpers can resolve class names.
         cache_mod.TurboQuantKVCache = TurboQuantKVCache
-        cache_mod.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
+        cache_mod.TurboQuantChunkedKVCache = TurboQuantChunkedKVCache
         cache_mod.TurboQuantBatchKVCache = TurboQuantBatchKVCache
-        cache_mod.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
         cache_mod.TurboQuantConcatenateKVCache = TurboQuantConcatenateKVCache
+        cache_mod.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
+        cache_mod.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
 
         original_make_prompt_cache = cache_mod.make_prompt_cache
 
@@ -637,10 +1346,11 @@ def patch_mlx_lm(
 __all__ = [
     "TurboQuantCacheStats",
     "TurboQuantKVCache",
-    "TurboQuantRotatingKVCache",
+    "TurboQuantChunkedKVCache",
     "TurboQuantBatchKVCache",
-    "TurboQuantBatchRotatingKVCache",
     "TurboQuantConcatenateKVCache",
+    "TurboQuantRotatingKVCache",
+    "TurboQuantBatchRotatingKVCache",
     "turboquantize_prompt_cache",
     "make_turbo_prompt_cache",
     "MLXLMTurboQuantPatcher",

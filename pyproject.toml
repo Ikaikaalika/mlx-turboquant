@@ -10,13 +10,34 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "TurboQuant MLX" }]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "mlx>=0.29.0",
   "numpy>=1.24",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Ikaikaalika/mlx-turboquant"
+Repository = "https://github.com/Ikaikaalika/mlx-turboquant"
+Issues = "https://github.com/Ikaikaalika/mlx-turboquant/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+  "build>=1.2.2",
+  "pytest>=8.0",
+]
+integration = [
+  "mlx-lm>=0.29.0",
+  "transformers>=4.40",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

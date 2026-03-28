@@ -1,0 +1,38 @@
+name: smoke-qwen
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Hugging Face model repo (<=1B params recommended)"
+        required: false
+        default: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+      max_tokens:
+        description: "Maximum generated tokens"
+        required: false
+        default: "24"
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,integration]"
+
+      - name: Run Qwen smoke test
+        run: |
+          python scripts/smoke_qwen_turboquant.py \
+            --model "${{ github.event.inputs.model }}" \
+            --max-tokens "${{ github.event.inputs.max_tokens }}" \
+            --max-impl-rel-l2 1e-5

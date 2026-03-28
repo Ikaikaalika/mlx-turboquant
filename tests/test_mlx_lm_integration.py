@@ -5,6 +5,8 @@ from mlx_lm.models import cache as mlx_cache
 
 from turboquant_mlx.mlx_lm_integration import (
     MLXLMTurboQuantPatcher,
+    TurboQuantBatchKVCache,
+    TurboQuantChunkedKVCache,
     TurboQuantKVCache,
     make_turbo_prompt_cache,
     turboquantize_prompt_cache,
@@ -43,6 +45,9 @@ def test_turboquantized_kv_cache_updates_and_reports_stats():
     assert stats is not None
     assert stats.quantized_bytes < stats.original_bytes
     assert stats.compression_ratio > 1.0
+    # Canonical cache state is compressed; dense tensors are released.
+    assert wrapped.keys is None
+    assert wrapped.values is None
 
 
 def test_turboquantize_prompt_cache_wraps_cachelist_entries():
@@ -75,9 +80,55 @@ def test_turboquant_kvcache_from_state_remains_usable():
     cache.update_and_fetch(keys, values)
 
     restored = TurboQuantKVCache.from_state(cache.state, cache.meta_state)
+    assert restored.offset == 16
+    assert restored.keys is None
+    assert restored.values is None
+
     new_keys = mx.array(rng.standard_normal((1, 2, 1, 32), dtype=np.float32))
     new_values = mx.array(rng.standard_normal((1, 2, 1, 32), dtype=np.float32))
     k_hat, v_hat = restored.update_and_fetch(new_keys, new_values)
 
     assert k_hat.shape[-2] == 17
     assert v_hat.shape[-2] == 17
+
+
+def test_turboquant_batch_kvcache_releases_dense_storage():
+    rng = np.random.default_rng(11)
+    cache = TurboQuantBatchKVCache(left_padding=[0, 1], key_bit_width=3, value_bit_width=3)
+
+    keys = mx.array(rng.standard_normal((2, 2, 8, 16), dtype=np.float32))
+    values = mx.array(rng.standard_normal((2, 2, 8, 16), dtype=np.float32))
+    k_hat, v_hat = cache.update_and_fetch(keys, values)
+
+    assert k_hat.shape == keys.shape
+    assert v_hat.shape == values.shape
+    assert cache.keys is None
+    assert cache.values is None
+
+
+def test_turboquantize_prompt_cache_wraps_chunked_cache():
+    chunked = mlx_cache.ChunkedKVCache(chunk_size=1024)
+    wrapped = turboquantize_prompt_cache([chunked], key_bit_width=3, value_bit_width=3)[0]
+    assert isinstance(wrapped, TurboQuantChunkedKVCache)
+
+
+def test_turboquant_chunked_kvcache_roundtrip_from_state():
+    rng = np.random.default_rng(13)
+    cache = TurboQuantChunkedKVCache(chunk_size=1024, key_bit_width=3, value_bit_width=3)
+
+    keys = mx.array(rng.standard_normal((1, 2, 12, 32), dtype=np.float32))
+    values = mx.array(rng.standard_normal((1, 2, 12, 32), dtype=np.float32))
+    cache.update_and_fetch(keys, values)
+
+    restored = TurboQuantChunkedKVCache.from_state(cache.state, cache.meta_state)
+    assert restored.chunk_size == 1024
+    assert restored.offset == 12
+    assert restored.keys is None
+    assert restored.values is None
+
+    new_keys = mx.array(rng.standard_normal((1, 2, 2, 32), dtype=np.float32))
+    new_values = mx.array(rng.standard_normal((1, 2, 2, 32), dtype=np.float32))
+    k_hat, v_hat = restored.update_and_fetch(new_keys, new_values)
+
+    assert k_hat.shape[-2] == 14
+    assert v_hat.shape[-2] == 14

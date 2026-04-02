@@ -42,6 +42,32 @@ cache = quantize_kv_cache(keys, values, key_bit_width=3, value_bit_width=4, seed
 keys_hat, values_hat = dequantize_kv_cache(cache)
 ```
 
+## Model Weight Helpers
+
+TurboQuant can also quantize model parameter trees (not only KV cache tensors):
+
+```python
+from turboquant_mlx import (
+    dequantize_model_weights,
+    quantize_model_weights,
+    turboquantize_model_weights,
+)
+
+# Quantize a parameter pytree and reconstruct dequantized weights later.
+packed = quantize_model_weights(model.parameters(), bit_width=4, algorithm="mse", seed=0)
+restored_params = dequantize_model_weights(packed)
+model.update(restored_params)
+
+# Convenience in-place helper (quantize + write back dequantized weights).
+packed_inplace = turboquantize_model_weights(model, bit_width=4, algorithm="mse", seed=0)
+print(packed_inplace.stats.compression_ratio)
+```
+
+Notes:
+- Floating-point tensor leaves are quantized.
+- Non-floating/scalar leaves are passed through unchanged.
+- `algorithm="mse"` is the default; `algorithm="prod"` is also supported.
+
 ## MLX-LM Integration
 
 Use the patcher to force prompt-cache construction to TurboQuant wrappers across `mlx_lm` entry points:

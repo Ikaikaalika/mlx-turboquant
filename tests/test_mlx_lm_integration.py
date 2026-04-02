@@ -5,9 +5,12 @@ from mlx_lm.models import cache as mlx_cache
 
 from turboquant_mlx.mlx_lm_integration import (
     MLXLMTurboQuantPatcher,
+    TurboQuantArraysCache,
     TurboQuantBatchKVCache,
     TurboQuantChunkedKVCache,
     TurboQuantKVCache,
+    TurboQuantMambaCache,
+    TurboQuantQuantizedKVCache,
     make_turbo_prompt_cache,
     turboquantize_prompt_cache,
 )
@@ -132,3 +135,50 @@ def test_turboquant_chunked_kvcache_roundtrip_from_state():
 
     assert k_hat.shape[-2] == 14
     assert v_hat.shape[-2] == 14
+
+
+def test_turboquantize_prompt_cache_wraps_quantized_kv_cache():
+    rng = np.random.default_rng(17)
+    quantized = mlx_cache.QuantizedKVCache(group_size=32, bits=4)
+    keys = mx.array(rng.standard_normal((1, 2, 4, 64), dtype=np.float32))
+    values = mx.array(rng.standard_normal((1, 2, 4, 64), dtype=np.float32))
+    quantized.update_and_fetch(keys, values)
+
+    wrapped = turboquantize_prompt_cache([quantized], key_bit_width=3, value_bit_width=3)[0]
+    assert isinstance(wrapped, TurboQuantQuantizedKVCache)
+
+    next_keys = mx.array(rng.standard_normal((1, 2, 1, 64), dtype=np.float32))
+    next_values = mx.array(rng.standard_normal((1, 2, 1, 64), dtype=np.float32))
+    k_hat, v_hat = wrapped.update_and_fetch(next_keys, next_values)
+    assert k_hat[0].shape[2] == 5
+    assert v_hat[0].shape[2] == 5
+
+
+def test_turboquantize_prompt_cache_wraps_arrays_cache():
+    arrays = mlx_cache.ArraysCache(size=2, left_padding=[1, 0])
+    arrays[0] = mx.array(np.arange(6, dtype=np.float32).reshape(2, 3))
+    arrays[1] = mx.array(np.arange(8, dtype=np.float32).reshape(2, 4))
+
+    wrapped = turboquantize_prompt_cache([arrays], key_bit_width=3, value_bit_width=3)[0]
+    assert isinstance(wrapped, TurboQuantArraysCache)
+    assert wrapped.last_turboquant_stats is None
+
+    batch_indices = mx.array([1], dtype=mx.int32)
+    wrapped.filter(batch_indices)
+    assert wrapped[0].shape[0] == 1
+    assert wrapped[1].shape[0] == 1
+
+
+def test_turboquantize_prompt_cache_wraps_mamba_cache():
+    mamba = mlx_cache.MambaCache(left_padding=[0, 1])
+    mamba[0] = mx.array(np.arange(12, dtype=np.float32).reshape(2, 2, 3))
+    mamba[1] = mx.array(np.arange(16, dtype=np.float32).reshape(2, 2, 4))
+
+    wrapped = turboquantize_prompt_cache([mamba], key_bit_width=3, value_bit_width=3)[0]
+    assert isinstance(wrapped, TurboQuantMambaCache)
+    assert wrapped.last_turboquant_stats is None
+
+    restored = TurboQuantMambaCache.from_state(wrapped.state, wrapped.meta_state)
+    assert isinstance(restored, TurboQuantMambaCache)
+    assert restored[0].shape == wrapped[0].shape
+    assert restored[1].shape == wrapped[1].shape

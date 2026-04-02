@@ -902,6 +902,159 @@ if mlx_cache is not None:
             self._tq_clear_dense_storage()
 
 
+    class TurboQuantQuantizedKVCache(mlx_cache.QuantizedKVCache):
+        """
+        Wrapper for mlx_lm QuantizedKVCache to keep prompt-cache wrapping universal.
+
+        Note: This cache is already quantized using mlx_lm's native quantization,
+        so TurboQuant is not re-applied here.
+        """
+
+        def __init__(self, group_size: int = 64, bits: int = 8):
+            super().__init__(group_size=group_size, bits=bits)
+            self._tq_stats: Optional[TurboQuantCacheStats] = None
+
+        @property
+        def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
+            return self._tq_stats
+
+        @classmethod
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantQuantizedKVCache":
+            del kwargs  # No TurboQuant-specific options apply to pre-quantized caches.
+            obj = cls(
+                group_size=int(getattr(cache, "group_size", 64)),
+                bits=int(getattr(cache, "bits", 8)),
+            )
+            obj.keys = copy_tree(getattr(cache, "keys", None))
+            obj.values = copy_tree(getattr(cache, "values", None))
+            obj.offset = int(getattr(cache, "offset", 0))
+            return obj
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            if not meta_state or len(meta_state) < 3:
+                obj = cls()
+                obj.state = state
+                return obj
+            offset, group_size, bits = map(int, meta_state)
+            obj = cls(group_size=group_size, bits=bits)
+            obj.state = copy_tree(state)
+            obj.offset = offset
+            return obj
+
+
+    class TurboQuantArraysCache(mlx_cache.ArraysCache):
+        """
+        Wrapper for mlx_lm ArraysCache (e.g. state-space models).
+
+        This class keeps cache wrapping universal while preserving native behavior.
+        """
+
+        def __init__(
+            self,
+            size: int,
+            left_padding: Optional[List[int]] = None,
+            *,
+            key_bit_width: int = 3,
+            value_bit_width: int = 3,
+            seed: int = 0,
+            pack: bool = True,
+            cache_id: int = 0,
+        ):
+            del key_bit_width, value_bit_width, seed, pack, cache_id
+            super().__init__(size=size, left_padding=left_padding)
+            self._tq_stats: Optional[TurboQuantCacheStats] = None
+
+        @property
+        def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
+            return self._tq_stats
+
+        @classmethod
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantArraysCache":
+            left_padding = None
+            if getattr(cache, "left_padding", None) is not None:
+                left_padding = np.asarray(cache.left_padding).astype(np.int32).tolist()
+            obj = cls(size=len(getattr(cache, "cache", [])), left_padding=left_padding, **kwargs)
+            obj.state = copy_tree(cache.state)
+            return obj
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            size = len(state) if state else 0
+            left_padding = None
+            if meta_state:
+                left_padding = np.asarray(meta_state).astype(np.int32).tolist()
+            obj = cls(size=size, left_padding=left_padding)
+            obj.state = copy_tree(state)
+            return obj
+
+        @property
+        def meta_state(self):
+            if self.left_padding is None:
+                return ()
+            return tuple(map(str, np.asarray(self.left_padding).astype(np.int32).tolist()))
+
+        @meta_state.setter
+        def meta_state(self, v):
+            if not v:
+                self.left_padding = None
+                return
+            self.left_padding = mx.array(np.asarray(v).astype(np.int32).tolist())
+
+
+    class TurboQuantMambaCache(mlx_cache.MambaCache):
+        """Wrapper for mlx_lm MambaCache to preserve universal cache wrapping."""
+
+        def __init__(
+            self,
+            left_padding: Optional[List[int]] = None,
+            *,
+            key_bit_width: int = 3,
+            value_bit_width: int = 3,
+            seed: int = 0,
+            pack: bool = True,
+            cache_id: int = 0,
+        ):
+            del key_bit_width, value_bit_width, seed, pack, cache_id
+            super().__init__(left_padding=left_padding)
+            self._tq_stats: Optional[TurboQuantCacheStats] = None
+
+        @property
+        def last_turboquant_stats(self) -> Optional[TurboQuantCacheStats]:
+            return self._tq_stats
+
+        @classmethod
+        def from_cache(cls, cache: Any, **kwargs) -> "TurboQuantMambaCache":
+            left_padding = None
+            if getattr(cache, "left_padding", None) is not None:
+                left_padding = np.asarray(cache.left_padding).astype(np.int32).tolist()
+            obj = cls(left_padding=left_padding, **kwargs)
+            obj.state = copy_tree(cache.state)
+            return obj
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            left_padding = None
+            if meta_state:
+                left_padding = np.asarray(meta_state).astype(np.int32).tolist()
+            obj = cls(left_padding=left_padding)
+            obj.state = copy_tree(state)
+            return obj
+
+        @property
+        def meta_state(self):
+            if self.left_padding is None:
+                return ()
+            return tuple(map(str, np.asarray(self.left_padding).astype(np.int32).tolist()))
+
+        @meta_state.setter
+        def meta_state(self, v):
+            if not v:
+                self.left_padding = None
+                return
+            self.left_padding = mx.array(np.asarray(v).astype(np.int32).tolist())
+
+
     class TurboQuantConcatenateKVCache(_LegacyTurboQuantMixin, mlx_cache.ConcatenateKVCache):
         def __init__(
             self,
@@ -1042,6 +1195,15 @@ else:  # pragma: no cover - mlx_lm unavailable fallback types
     class TurboQuantBatchKVCache:  # type: ignore[override]
         pass
 
+    class TurboQuantQuantizedKVCache:  # type: ignore[override]
+        pass
+
+    class TurboQuantArraysCache:  # type: ignore[override]
+        pass
+
+    class TurboQuantMambaCache:  # type: ignore[override]
+        pass
+
     class TurboQuantConcatenateKVCache:  # type: ignore[override]
         pass
 
@@ -1060,11 +1222,24 @@ def copy_array(x: Any) -> Any:
     return x
 
 
+def copy_tree(x: Any) -> Any:
+    if isinstance(x, list):
+        return [copy_tree(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(copy_tree(v) for v in x)
+    if isinstance(x, dict):
+        return {k: copy_tree(v) for k, v in x.items()}
+    return copy_array(x)
+
+
 if mlx_cache is not None:
     # Register classes for mlx_lm cache (de)serialization resolution.
     mlx_cache.TurboQuantKVCache = TurboQuantKVCache
     mlx_cache.TurboQuantChunkedKVCache = TurboQuantChunkedKVCache
     mlx_cache.TurboQuantBatchKVCache = TurboQuantBatchKVCache
+    mlx_cache.TurboQuantQuantizedKVCache = TurboQuantQuantizedKVCache
+    mlx_cache.TurboQuantArraysCache = TurboQuantArraysCache
+    mlx_cache.TurboQuantMambaCache = TurboQuantMambaCache
     mlx_cache.TurboQuantConcatenateKVCache = TurboQuantConcatenateKVCache
     mlx_cache.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
     mlx_cache.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
@@ -1087,6 +1262,9 @@ def _wrap_single_cache(
             TurboQuantKVCache,
             TurboQuantChunkedKVCache,
             TurboQuantBatchKVCache,
+            TurboQuantQuantizedKVCache,
+            TurboQuantArraysCache,
+            TurboQuantMambaCache,
             TurboQuantConcatenateKVCache,
             TurboQuantRotatingKVCache,
             TurboQuantBatchRotatingKVCache,
@@ -1118,6 +1296,12 @@ def _wrap_single_cache(
 
     if isinstance(cache_obj, cache_mod.BatchKVCache):
         return TurboQuantBatchKVCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.MambaCache):
+        return TurboQuantMambaCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.ArraysCache):
+        return TurboQuantArraysCache.from_cache(cache_obj, **kwargs)
+    if isinstance(cache_obj, cache_mod.QuantizedKVCache):
+        return TurboQuantQuantizedKVCache.from_cache(cache_obj, **kwargs)
     if isinstance(cache_obj, cache_mod.ChunkedKVCache):
         return TurboQuantChunkedKVCache.from_cache(cache_obj, **kwargs)
     if isinstance(cache_obj, cache_mod.KVCache):
@@ -1231,6 +1415,9 @@ class MLXLMTurboQuantPatcher:
         cache_mod.TurboQuantKVCache = TurboQuantKVCache
         cache_mod.TurboQuantChunkedKVCache = TurboQuantChunkedKVCache
         cache_mod.TurboQuantBatchKVCache = TurboQuantBatchKVCache
+        cache_mod.TurboQuantQuantizedKVCache = TurboQuantQuantizedKVCache
+        cache_mod.TurboQuantArraysCache = TurboQuantArraysCache
+        cache_mod.TurboQuantMambaCache = TurboQuantMambaCache
         cache_mod.TurboQuantConcatenateKVCache = TurboQuantConcatenateKVCache
         cache_mod.TurboQuantRotatingKVCache = TurboQuantRotatingKVCache
         cache_mod.TurboQuantBatchRotatingKVCache = TurboQuantBatchRotatingKVCache
@@ -1348,6 +1535,9 @@ __all__ = [
     "TurboQuantKVCache",
     "TurboQuantChunkedKVCache",
     "TurboQuantBatchKVCache",
+    "TurboQuantQuantizedKVCache",
+    "TurboQuantArraysCache",
+    "TurboQuantMambaCache",
     "TurboQuantConcatenateKVCache",
     "TurboQuantRotatingKVCache",
     "TurboQuantBatchRotatingKVCache",

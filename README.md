@@ -68,6 +68,62 @@ Notes:
 - Non-floating/scalar leaves are passed through unchanged.
 - `algorithm="mse"` is the default; `algorithm="prod"` is also supported.
 
+### Save/Load TurboQuant Artifacts
+
+```python
+from turboquant_mlx import load_turboquant_weights, save_turboquant_weights
+
+# Saves:
+# - config.json with a `turboquant` block
+# - turboquant-weights*.safetensors + index
+# - turboquant-passthrough*.safetensors + index
+# - turboquant-metadata.json
+save_turboquant_weights(model.parameters(), "artifacts/my-model-tq", bit_width=4, seed=0)
+
+restored = load_turboquant_weights("artifacts/my-model-tq")
+model.update(restored)
+```
+
+## MLX-LM Model Weight Integration
+
+You can convert and reload any `mlx_lm` model using TurboQuant-compressed on-disk
+weights (runtime remains load-dequantized MLX tensors for broad compatibility).
+
+```python
+from turboquant_mlx import (
+    convert_turboquant_mlx_lm_model,
+    load_turboquant_mlx_lm,
+    patch_mlx_lm_weights,
+)
+
+summary = convert_turboquant_mlx_lm_model(
+    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    "artifacts/qwen-tq",
+    bit_width=4,
+    algorithm="mse",
+    seed=0,
+)
+
+model, tokenizer = load_turboquant_mlx_lm("artifacts/qwen-tq")
+
+# Optional transparent load() patching:
+weight_patcher = patch_mlx_lm_weights()
+try:
+    from mlx_lm import load
+    model2, tokenizer2 = load("artifacts/qwen-tq")
+finally:
+    weight_patcher.restore()
+```
+
+CLI conversion:
+
+```bash
+python scripts/convert_mlx_lm_turboquant_weights.py \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --output artifacts/qwen-tq \
+  --bit-width 4
+```
+
 ## MLX-LM Integration
 
 Use the patcher to force prompt-cache construction to TurboQuant wrappers across `mlx_lm` entry points:
@@ -122,6 +178,21 @@ This checks:
 - Dense KV tensors are released for compressed canonical wrappers.
 - Wrapper state matches direct TurboQuant round-trip (implementation correctness).
 - Baseline/Turbo text match is reported as telemetry only (not a hard gate).
+
+## Matrix Smoke (Manual)
+
+Run model-weight conversion/load checks across multiple model families:
+
+```bash
+python scripts/smoke_mlx_lm_turboquant_weights_matrix.py \
+  --models \
+    mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+    mlx-community/Llama-3.2-1B-Instruct-4bit \
+    mlx-community/SmolLM2-360M-Instruct-4bit
+```
+
+The script reports per-model conversion success, load success, sample generation,
+and storage reduction metrics.
 
 ## Benchmarks
 

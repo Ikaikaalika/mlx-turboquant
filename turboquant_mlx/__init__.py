@@ -1,4 +1,9 @@
 from .core import (
+    TURBOQUANT_CONFIG_KEY,
+    TURBOQUANT_FORMAT_VERSION,
+    TURBOQUANT_METADATA_FILENAME,
+    TURBOQUANT_PASSTHROUGH_INDEX_FILENAME,
+    TURBOQUANT_WEIGHT_INDEX_FILENAME,
     QuantizedModelWeights,
     PackedMSECodes,
     PackedProdCodes,
@@ -7,10 +12,12 @@ from .core import (
     QuantizedWeightsStats,
     TurboQuantMSE,
     TurboQuantProd,
+    load_turboquant_weights,
     dequantize_model_weights,
     dequantize_kv_cache,
     quantize_model_weights,
     quantize_kv_cache,
+    save_turboquant_weights,
     turboquantize_model_weights,
 )
 from .mlx_lm_integration import (
@@ -26,8 +33,20 @@ from .mlx_lm_integration import (
     turboquantize_mlx_lm,
     turboquantize_prompt_cache,
 )
+from .mlx_lm_weights import (
+    MLXLMTurboQuantWeightPatcher,
+    convert_turboquant_mlx_lm_model,
+    load_turboquant_mlx_lm,
+    patch_mlx_lm_weights,
+    turboquantize_mlx_lm_weights,
+)
 
 __all__ = [
+    "TURBOQUANT_CONFIG_KEY",
+    "TURBOQUANT_FORMAT_VERSION",
+    "TURBOQUANT_METADATA_FILENAME",
+    "TURBOQUANT_WEIGHT_INDEX_FILENAME",
+    "TURBOQUANT_PASSTHROUGH_INDEX_FILENAME",
     "PackedMSECodes",
     "PackedProdCodes",
     "TurboQuantMSE",
@@ -41,6 +60,8 @@ __all__ = [
     "quantize_model_weights",
     "dequantize_model_weights",
     "turboquantize_model_weights",
+    "save_turboquant_weights",
+    "load_turboquant_weights",
     "TurboQuantKVCache",
     "TurboQuantChunkedKVCache",
     "TurboQuantRotatingKVCache",
@@ -52,4 +73,9 @@ __all__ = [
     "MLXLMTurboQuantPatcher",
     "turboquantize_mlx_lm",
     "patch_mlx_lm",
+    "convert_turboquant_mlx_lm_model",
+    "load_turboquant_mlx_lm",
+    "MLXLMTurboQuantWeightPatcher",
+    "patch_mlx_lm_weights",
+    "turboquantize_mlx_lm_weights",
 ]
